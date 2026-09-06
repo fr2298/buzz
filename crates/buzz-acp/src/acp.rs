@@ -22,6 +22,12 @@ use crate::usage::{
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Upper bound on buffered `agent_message_chunk` text per turn (see
+/// [`AcpClient::turn_text`]). Only the head of the reply is needed to
+/// recognise a provider-failure report, so a small cap keeps memory flat
+/// even for agents that stream very long answers.
+pub(crate) const TURN_TEXT_CAP: usize = 4096;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -189,6 +195,12 @@ pub struct AcpClient {
     /// Other agents may leave this unset — readers must treat `None` as
     /// "no active run to steer into" and fall back to cancel+merge.
     active_run_id: Option<String>,
+    /// Concatenated `agent_message_chunk` text for the current turn, capped at
+    /// [`TURN_TEXT_CAP`] bytes. Cleared at every `session/prompt`. The harness
+    /// inspects it after a turn "succeeds" to detect adapters (e.g. hermes)
+    /// that report provider failures as ordinary agent text instead of a
+    /// JSON-RPC error — see `lib.rs::classify_provider_failure`.
+    turn_text: String,
     /// Whether the agent advertised `_meta.steering.supported: true` in its
     /// `initialize` response, meaning it implements the cross-adapter
     /// [`ACP_STEER_METHOD`] extension.
@@ -558,6 +570,7 @@ impl AcpClient {
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
             active_run_id: None,
+            turn_text: String::new(),
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
@@ -784,6 +797,7 @@ impl AcpClient {
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
+        self.turn_text.clear();
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
@@ -870,6 +884,13 @@ impl AcpClient {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn active_run_id(&self) -> Option<&str> {
         self.active_run_id.as_deref()
+    }
+
+    /// Text the agent streamed via `agent_message_chunk` during the most
+    /// recent turn (capped at [`TURN_TEXT_CAP`] bytes). Empty if the adapter
+    /// never streams text (e.g. agents that only reply through tool calls).
+    pub fn turn_text(&self) -> &str {
+        &self.turn_text
     }
 
     /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
@@ -1756,6 +1777,14 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    let room = TURN_TEXT_CAP.saturating_sub(self.turn_text.len());
+                    if room > 0 {
+                        let mut end = text.len().min(room);
+                        while end > 0 && !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        self.turn_text.push_str(&text[..end]);
+                    }
                 }
                 false
             }

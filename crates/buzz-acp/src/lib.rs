@@ -3739,6 +3739,19 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
+        // Channel paused after repeated provider failures: the agent cannot
+        // answer, so drop the batch (a notice was already posted when the
+        // cooldown started) rather than spend another doomed turn on it.
+        if let Some(remaining) = queue.cooldown_remaining(channel_id) {
+            tracing::warn!(
+                channel = %channel_id,
+                events = batch.events.len(),
+                cooldown_remaining_secs = remaining.as_secs(),
+                "provider_failure_cooldown: dropping batch"
+            );
+            queue.mark_complete(channel_id);
+            continue;
+        }
         let typing_scope = batch
             .events
             .last()
@@ -3848,6 +3861,132 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
         return false;
     };
     message.contains("Re-authenticate") || message.contains("API Error: 401")
+}
+
+// ── Provider failures reported as agent text ──────────────────────────────
+//
+// Some ACP adapters (hermes-agent) do not surface an exhausted model provider
+// as a JSON-RPC error. After their internal retries they return a normal
+// `end_turn` whose only agent text is "API call failed after N retries: …".
+// buzz-acp never posts agent text itself — the agent replies through the
+// `buzz` CLI — so with the model down, nothing reaches the channel and the
+// owner sees a silent bot. On 2026-09-06 this hid a 429 usage-limit outage
+// for a whole day. `classify_provider_failure` recognises that text so the
+// harness can post a notice and, after the same class repeats
+// `BUZZ_ACP_PROVIDER_FAILURE_STREAK` turns in a row, pause the channel for
+// `BUZZ_ACP_PROVIDER_FAILURE_COOLDOWN` seconds instead of burning retries.
+
+/// Default consecutive failed turns (same class) before a channel cools down.
+const DEFAULT_PROVIDER_FAILURE_STREAK: u32 = 3;
+/// Default cooldown once the streak threshold is hit.
+const DEFAULT_PROVIDER_FAILURE_COOLDOWN_SECS: u64 = 1800;
+/// How much of the agent's failure text is echoed into the channel notice.
+const PROVIDER_FAILURE_EXCERPT_CHARS: usize = 300;
+
+fn provider_failure_streak_threshold() -> u32 {
+    std::env::var("BUZZ_ACP_PROVIDER_FAILURE_STREAK")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_PROVIDER_FAILURE_STREAK)
+}
+
+fn provider_failure_cooldown() -> Duration {
+    let secs = std::env::var("BUZZ_ACP_PROVIDER_FAILURE_COOLDOWN")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROVIDER_FAILURE_COOLDOWN_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Classify agent reply text that is really a provider-failure report.
+///
+/// Returns a stable class label (`"rate_limit"`, `"auth"`, `"provider"`) when
+/// the text is the *whole* reply of a failed turn — i.e. it starts with a known
+/// adapter failure prefix — and `None` for ordinary replies, even ones that
+/// merely mention "429" somewhere in a sentence.
+fn classify_provider_failure(text: &str) -> Option<&'static str> {
+    let head = text.trim_start();
+    let is_failure_report = head.starts_with("API call failed after")
+        || head.starts_with("Error: ")
+        || head.starts_with("API Error:");
+    if !is_failure_report {
+        return None;
+    }
+    let lower = head.to_ascii_lowercase();
+    if lower.contains("429")
+        || lower.contains("usage limit")
+        || lower.contains("usage_limit")
+        || lower.contains("rate limit")
+        || lower.contains("ratelimit")
+        || lower.contains("quota")
+    {
+        Some("rate_limit")
+    } else if lower.contains("401")
+        || lower.contains("re-authenticate")
+        || lower.contains("invalid api key")
+        || lower.contains("unauthorized")
+    {
+        Some("auth")
+    } else {
+        Some("provider")
+    }
+}
+
+fn provider_failure_excerpt(text: &str) -> String {
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= PROVIDER_FAILURE_EXCERPT_CHARS {
+        one_line
+    } else {
+        let cut: String = one_line.chars().take(PROVIDER_FAILURE_EXCERPT_CHARS).collect();
+        format!("{cut}…")
+    }
+}
+
+/// Build the channel notice for a provider-failure turn. `streak` is the
+/// consecutive count after this turn; `cooldown` is `Some` when this turn
+/// tipped the channel into cooldown.
+fn provider_failure_notice(
+    class: &str,
+    streak: u32,
+    threshold: u32,
+    excerpt: &str,
+    cooldown: Option<Duration>,
+) -> String {
+    let label = match class {
+        "rate_limit" => "모델 사용량 한도 초과 (429)",
+        "auth" => "모델 인증 실패",
+        _ => "모델 호출 실패",
+    };
+    let mut notice = format!(
+        "⚠️ {label} — 에이전트가 내부 재시도 후에도 응답을 만들지 못했습니다 ({streak}/{threshold}회 연속).\n{excerpt}"
+    );
+    match cooldown {
+        Some(d) => {
+            let mins = d.as_secs().div_ceil(60);
+            notice.push_str(&format!(
+                "\n같은 오류가 {threshold}회 연속이라 이 채널의 응답을 {mins}분간 중단합니다. 그동안 도착한 요청은 처리하지 않으니, 복구 후 다시 요청해 주세요."
+            ));
+        }
+        None => notice.push_str(
+            "\n같은 오류가 이어지면 잠시 응답을 중단하고 알려드립니다.",
+        ),
+    }
+    notice
+}
+
+/// Post a provider-failure notice to `channel_id` (top-level, not threaded).
+fn spawn_provider_failure_notice(
+    rest_client: Option<&relay::RestClient>,
+    channel_id: Uuid,
+    content: String,
+) {
+    if let Some(rest) = rest_client {
+        let rest = rest.clone();
+        tokio::spawn(async move {
+            pool::post_failure_notice(&rest, channel_id, &ThreadTags::default(), &content).await;
+        });
+    }
 }
 
 /// Spawn a task that posts a user-visible failure notice to the relay.
@@ -4100,6 +4239,40 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
+            // A turn that "succeeded" but whose agent text is a provider
+            // failure report (hermes after its own retries) would otherwise
+            // leave the channel silent — the agent is what posts replies.
+            if let pool::PromptSource::Channel(channel_id) = result.source {
+                match classify_provider_failure(result.agent.acp.turn_text()) {
+                    Some(class) => {
+                        let threshold = provider_failure_streak_threshold();
+                        let streak = queue.record_provider_failure(channel_id, class);
+                        let excerpt = provider_failure_excerpt(result.agent.acp.turn_text());
+                        let cooldown = if streak >= threshold {
+                            let d = provider_failure_cooldown();
+                            queue.set_cooldown(channel_id, d);
+                            Some(d)
+                        } else {
+                            None
+                        };
+                        tracing::warn!(
+                            agent = agent_index,
+                            channel = %channel_id,
+                            class,
+                            streak,
+                            threshold,
+                            cooldown_secs = cooldown.map(|d| d.as_secs()),
+                            "provider_failure_turn: {excerpt}"
+                        );
+                        spawn_provider_failure_notice(
+                            rest_client,
+                            channel_id,
+                            provider_failure_notice(class, streak, threshold, &excerpt, cooldown),
+                        );
+                    }
+                    None => queue.clear_provider_failure(channel_id),
+                }
+            }
             pool.return_agent(result.agent);
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
@@ -8833,5 +9006,68 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod provider_failure_tests {
+    use super::*;
+
+    #[test]
+    fn hermes_429_report_is_rate_limit() {
+        let text = "API call failed after 3 retries: HTTP 429: The usage limit has been reached";
+        assert_eq!(classify_provider_failure(text), Some("rate_limit"));
+        // Leading whitespace / newlines from streaming must not matter.
+        assert_eq!(classify_provider_failure(&format!("\n  {text}")), Some("rate_limit"));
+    }
+
+    #[test]
+    fn hermes_generic_error_prefix_is_provider() {
+        assert_eq!(
+            classify_provider_failure("Error: connection reset by peer"),
+            Some("provider")
+        );
+        assert_eq!(
+            classify_provider_failure("API call failed after 3 retries: 401 Unauthorized"),
+            Some("auth")
+        );
+    }
+
+    #[test]
+    fn ordinary_replies_are_not_failures() {
+        assert_eq!(classify_provider_failure(""), None);
+        assert_eq!(classify_provider_failure("네, 429 오류는 사용량 한도 초과를 뜻합니다."), None);
+        assert_eq!(
+            classify_provider_failure("The API call failed after 3 retries yesterday, but it works now."),
+            None
+        );
+        assert_eq!(classify_provider_failure("Errors: none. All good."), None);
+    }
+
+    #[test]
+    fn excerpt_collapses_whitespace_and_truncates() {
+        let long = "API call failed after 3 retries:\n\n  HTTP 429 ".repeat(20);
+        let excerpt = provider_failure_excerpt(&long);
+        assert!(!excerpt.contains('\n'));
+        assert!(excerpt.chars().count() <= PROVIDER_FAILURE_EXCERPT_CHARS + 1);
+        assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn notice_mentions_cooldown_only_when_tipped() {
+        let plain = provider_failure_notice("rate_limit", 1, 3, "x", None);
+        assert!(plain.contains("1/3"));
+        assert!(!plain.contains("중단합니다"));
+        let tipped = provider_failure_notice("rate_limit", 3, 3, "x", Some(Duration::from_secs(1800)));
+        assert!(tipped.contains("3/3"));
+        assert!(tipped.contains("30분간 중단"));
+    }
+
+    #[test]
+    fn env_overrides_have_sane_fallbacks() {
+        // Not set (or garbage) → defaults. We avoid mutating the process env
+        // here since tests run in parallel; just assert the defaults exist.
+        assert_eq!(DEFAULT_PROVIDER_FAILURE_STREAK, 3);
+        assert_eq!(DEFAULT_PROVIDER_FAILURE_COOLDOWN_SECS, 1800);
     }
 }

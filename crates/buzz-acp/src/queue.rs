@@ -146,6 +146,18 @@ pub struct EventQueue {
     retry_after: HashMap<Uuid, Instant>,
     /// Per-channel retry attempt counter for exponential backoff / dead-lettering.
     retry_counts: HashMap<Uuid, u32>,
+    /// Per-channel streak of consecutive turns that "succeeded" at the ACP
+    /// level but whose agent text was a provider-failure report (e.g. hermes
+    /// returning "API call failed after 3 retries: HTTP 429 …" as a normal
+    /// reply). Keyed by channel; value is `(error class, consecutive count)`.
+    /// Reset by [`clear_provider_failure`](Self::clear_provider_failure) on
+    /// the next healthy turn.
+    provider_failures: HashMap<Uuid, (String, u32)>,
+    /// Channels whose intake is paused until the given instant because the
+    /// same provider-failure class repeated `--provider-failure-streak` turns
+    /// in a row. Batches flushed for a cooling-down channel are dropped by
+    /// `dispatch_pending` instead of being sent to an agent that cannot answer.
+    cooldown_until: HashMap<Uuid, Instant>,
     dedup_mode: DedupMode,
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
@@ -186,6 +198,8 @@ impl EventQueue {
             in_flight_batch_sizes: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
+            provider_failures: HashMap::new(),
+            cooldown_until: HashMap::new(),
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
@@ -855,6 +869,57 @@ impl EventQueue {
                 || self.queues.get(ch).is_some_and(|q| !q.is_empty())
                 || self.in_flight_channels.contains(ch)
         });
+        self.cooldown_until.retain(|_, until| *until > now);
+    }
+
+    // ── Provider-failure streak / cooldown ──────────────────────────────
+    //
+    // A turn can complete with `PromptOutcome::Ok` while the agent's only
+    // output is a provider-failure report (hermes: "API call failed after 3
+    // retries: HTTP 429 …"). Nothing reaches the channel in that case because
+    // the agent itself is what normally posts replies. These helpers let the
+    // harness (1) post a notice on each such turn and (2) stop feeding the
+    // agent after the same failure class repeats N turns in a row.
+
+    /// Record a provider-failure turn for `channel_id`. Returns the new
+    /// consecutive-failure count for `class` (1 on the first failure, or when
+    /// the class changed since the previous failure).
+    pub fn record_provider_failure(&mut self, channel_id: Uuid, class: &str) -> u32 {
+        let entry = self
+            .provider_failures
+            .entry(channel_id)
+            .or_insert_with(|| (class.to_string(), 0));
+        if entry.0 != class {
+            *entry = (class.to_string(), 0);
+        }
+        entry.1 += 1;
+        entry.1
+    }
+
+    /// Forget the provider-failure streak for `channel_id` (healthy turn).
+    pub fn clear_provider_failure(&mut self, channel_id: Uuid) {
+        self.provider_failures.remove(&channel_id);
+    }
+
+    /// Pause intake for `channel_id` for `duration`. Also resets the streak so
+    /// the first turn after the cooldown starts counting from 1 again.
+    pub fn set_cooldown(&mut self, channel_id: Uuid, duration: Duration) {
+        self.cooldown_until
+            .insert(channel_id, Instant::now() + duration);
+        self.provider_failures.remove(&channel_id);
+    }
+
+    /// Remaining cooldown for `channel_id`, or `None` when intake is open.
+    /// Expired entries are removed on read.
+    pub fn cooldown_remaining(&mut self, channel_id: Uuid) -> Option<Duration> {
+        let until = *self.cooldown_until.get(&channel_id)?;
+        let now = Instant::now();
+        if until > now {
+            Some(until - now)
+        } else {
+            self.cooldown_until.remove(&channel_id);
+            None
+        }
     }
 }
 
@@ -5878,5 +5943,56 @@ mod tests {
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
         );
+    }
+
+    // ── provider-failure streak / cooldown ──────────────────────────────
+
+    #[test]
+    fn provider_failure_streak_counts_same_class_and_resets_on_class_change() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        assert_eq!(q.record_provider_failure(ch, "rate_limit"), 1);
+        assert_eq!(q.record_provider_failure(ch, "rate_limit"), 2);
+        // A different failure class starts a fresh streak.
+        assert_eq!(q.record_provider_failure(ch, "auth"), 1);
+        assert_eq!(q.record_provider_failure(ch, "auth"), 2);
+        // Healthy turn clears it.
+        q.clear_provider_failure(ch);
+        assert_eq!(q.record_provider_failure(ch, "auth"), 1);
+    }
+
+    #[test]
+    fn provider_failure_streak_is_per_channel() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert_eq!(q.record_provider_failure(a, "rate_limit"), 1);
+        assert_eq!(q.record_provider_failure(a, "rate_limit"), 2);
+        assert_eq!(q.record_provider_failure(b, "rate_limit"), 1);
+    }
+
+    #[test]
+    fn cooldown_blocks_until_expiry_and_resets_streak() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        assert!(q.cooldown_remaining(ch).is_none());
+        q.record_provider_failure(ch, "rate_limit");
+        q.set_cooldown(ch, Duration::from_millis(80));
+        let remaining = q.cooldown_remaining(ch).expect("cooling down");
+        assert!(remaining <= Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(q.cooldown_remaining(ch).is_none(), "cooldown must expire");
+        // Streak was reset by set_cooldown: next failure counts from 1.
+        assert_eq!(q.record_provider_failure(ch, "rate_limit"), 1);
+    }
+
+    #[test]
+    fn compact_expired_state_drops_expired_cooldowns() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.set_cooldown(ch, Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(20));
+        q.compact_expired_state();
+        assert!(q.cooldown_until.is_empty());
     }
 }
